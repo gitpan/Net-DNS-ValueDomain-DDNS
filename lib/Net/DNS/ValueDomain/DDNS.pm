@@ -1,94 +1,20 @@
 package Net::DNS::ValueDomain::DDNS;
 
 use strict;
+use base qw/Class::Accessor::Fast Class::ErrorHandler/;
+
+use Carp;
+use Readonly;
+
 use LWP::UserAgent;
-use vars qw/$use_https/;
+use HTTP::Request::Common;
 
-our $VERSION = '0.01';
+our $VERSION = '0.02';
 
-use constant URL => 'dyn.value-domain.com/cgi-bin/dyn.fcg';
-use constant SSL_PREFIX => 'ss1.xrea.com';
+Readonly::Scalar my $URL        => 'dyn.value-domain.com/cgi-bin/dyn.fcg';
+Readonly::Scalar my $SSL_PREFIX => 'ss1.xrea.com';
 
-sub new {
-    my $class = shift;
-    my $args = shift;
-
-    my $self = bless {}, $class;
-
-    $self->_set($args) if ref $args eq 'HASH';
-
-    eval "use Crypt::SSLeay";
-    $use_https++ unless $@;
-
-    $self->{_ua} = LWP::UserAgent->new;
-
-    $self;
-}
-
-sub _set {
-    my $self = shift;
-    my $args = shift;
-
-    return unless ref $args eq 'HASH';
-
-    map { $self->{_arguments}->{$_} = $args->{$_} } keys %$args;
-}
-
-sub error {
-    my $self = shift;
-    my $error = shift;
-
-    if ($error) {
-	$self->{_error} = $error;
-	$self->{_error} .= "\n" unless $self->{_error} =~ /\n$/;
-	return 1;
-    }
-
-    return $self->{_error};
-}
-
-sub protocol {
-    my $self = shift;
-
-    return ($use_https) ? 'https' : 'http';
-}
-
-sub update {
-    my $self = shift;
-    my $args = shift;
-
-    delete $self->{_arguments}->{domain};
-    delete $self->{_arguments}->{host};
-    $self->_set($args);
-
-    die 'domain required' unless $self->{_arguments}->{domain};
-    die 'password required' unless $self->{_arguments}->{password};
-    
-    my $ua = $self->{_ua};
-    my $url = ($use_https) ? 'https://'.SSL_PREFIX.'/'.URL : 'http://'.URL;
-
-    my $query = "?d=$self->{_arguments}->{domain}&$self->{_arguments}->{password}";
-    $query .= "&h=$self->{_arguments}->{host}" if $self->{_arguments}->{host};
-    $query .= "&i=$self->{_arguments}->{ip}" if $self->{_arguments}->{ip};
-    
-    my $res = $ua->request(HTTP::Request->new(GET => $url.$query));
-
-    unless ($res->is_success) {
-	$self->error($res->status_line);
-	return;
-    }
-    
-    unless($res->content =~ /status=0/) {
-	my @contents = split /\r?\n/, $res->content;
-	$self->error($contents[1]);
-	return;
-    }
-
-    1;
-}
-    
-1;
-__END__
+__PACKAGE__->mk_accessors(qw/ua/);
 
 =head1 NAME
 
@@ -96,17 +22,28 @@ Net::DNS::ValueDomain::DDNS - Update your Value-Domain (https://www.value-domain
 
 =head1 SYNOPSIS
 
-  use Net::DNS::ValueDomain::DDNS;
-  
-  my $ddns = Net::DNS::ValueDomain::DDNS->new;
-  $ddns->update({
-    domain => 'example.com',
-    password => 'your password',
-    host => 'www',
-    ip => 'your ip',
-  });
-  $ddns->update({ domain => 'example.net', host => 'example' });
-
+    use Net::DNS::ValueDomain::DDNS;
+    
+    # Normal usage
+    my $ddns = Net::DNS::ValueDomain::DDNS->new;
+    
+    $ddns->update(
+        domain   => 'example.com',
+        password => '1234',
+        host     => 'www',
+        ip       => '127.0.0.1',
+    );
+    
+    # Update multiple hosts on same IP
+    my $ddns = Net::DNS::ValueDomain::DDNS->new(
+        domain   => 'example.com',
+        password => '1234',
+        ip       => '127.0.0.1',
+    );
+    
+    for my $host (qw/www mail */) {
+        $ddns->update( host => $host ) or die $ddns->errstr;
+    }
 
 =head1 DESCRIPTION
 
@@ -114,45 +51,144 @@ This module help you to update your Value-Domain (https://www.value-domain.com/)
 
 =head1 METHODS
 
-=item new(\%pamam)
+=head2 new( %config | \%config )
 
-Create a new Object. All \%param keys and values (except 'host' and 'domain') is kept in this object, and used by update() function.
+Create a new Object. All %config keys and values (except 'host' and 'domain') is kept and reused by update() function.
 
-=item update(\%param)
+=cut
 
-update your DynamicDNS record. \%param is:
+sub new {
+    my $class  = shift;
+    my $config = @_ > 1 ? {@_} : $_[0];
 
-=over 8
+    my $self = bless {}, $class;
 
-C<domain> - Your Domain name being updated. (Required)
+    $self->config($config) if $config;
 
-C<password> - Your Value-Domain Dynamic DNS Password. (Required)
+    if ( !$self->config->{use_https} ) {
+        eval { require Crypt::SSLeay; };
+        if ($@) {
+            carp
+                "Require Crypt::SSLeay for ssl connection. If you don't want to do that, try new( use_https => 0 ).";
+            $self->config->{use_https} = 0;
+        }
+    }
 
-C<host> - Your Sub-domain name being updated. For example if your hostname is "www.example.com" you should set "www" here. (Optional)
+    $self->ua( LWP::UserAgent->new );
+
+    $self;
+}
+
+=head2 config( %config | \%config )
+
+set config veriables
+
+=cut
+
+sub config {
+    my $self   = shift;
+    my $config = @_ > 1 ? {@_} : $_[0];
+
+    $self->{_config} ||= {};
+
+    if ($config) {
+        map { $self->{_config}->{$_} = $config->{$_} } keys %$config;
+    }
+
+    $self->{_config};
+}
+
+=head2 protocol
+
+return used protocol name. 'http' or 'https'
+
+=cut
+
+sub protocol {
+    shift->config->{use_https} ? 'https' : 'http';
+}
+
+=head2 update( %config | \%config )
+
+Update your DynamicDNS record. %config parameters are:
+
+=over 4
+
+C<domain> - Domain name being updated. (Required)
+
+C<password> - Value-Domain Dynamic DNS Password. (Required)
+
+C<host> - Sub-domain name being updated. For example if your hostname is "www.example.com" you should set "www" here. (Optional)
 
 C<ip> - The IP address to be updated. if empty, your current ip is used. (Optional)
 
 =back
 
-Return undef, if something error has occered. Use error() method for detail.
+If something error has be occurred, return undef. Use errstr() method to get error message.
 
-=item protocol()
+=cut
 
-return used protocol name. 'http' or 'https'.
+sub update {
+    my $self = shift;
+    my $args = @_ > 1 ? {@_} : $_[0];
 
-=item error()
+    my $config = $self->config($args);
+
+    croak 'domain is required'   unless $config->{domain};
+    croak 'password is required' unless $config->{password};
+
+    my $url =
+        ( $config->{use_https} )
+        ? "https://$SSL_PREFIX/$URL"
+        : "http://$URL";
+
+    my $parameters = {
+        d => $config->{domain},
+        p => $config->{password},
+        h => $config->{host} || q{},
+        i => $config->{ip} || q{},
+    };
+    my $query = '?';
+    while ( my ( $k, $v ) = each %$parameters ) {
+        $query .= "$k=$v&",;
+    }
+
+    my $res = $self->ua->get( $url . $query );
+
+    unless ( $res->is_success ) {
+        $self->error( $res->status_line );
+        return;
+    }
+
+    unless ( $res->content =~ /status=0/ ) {
+        my $error = $res->content;
+        chomp $error;
+        $self->error($error);
+        return;
+    }
+
+    1;
+}
+
+=head2 errstr()
 
 return last error.
 
+=head1 ACCESSORS
+
+=head2 ua
+
+L<LWP::UserAgent> object.
+
 =head1 AUTHOR
 
-Daisuke Murase, E<lt>typester@unknownplace.orgE<gt>
+Daisuke Murase, E<lt>typester@cpan.orgE<gt>
 
-=head1 COPYRIGHT AND LICENSE
-
-Copyright (C) 2005 by Daisuke Murase
+=head1 LICENSE
 
 This library is free software; you can redistribute it and/or modify
 it under the same terms as Perl itself.
 
 =cut
+
+1;
